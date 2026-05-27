@@ -2,6 +2,7 @@
 
 from typing import Any, Callable
 
+from photon._native import execute_task
 from photon.future import Future
 
 
@@ -23,8 +24,8 @@ class RemoteFunction:
 
     def remote(self, *args: Any, **kwargs: Any) -> Future:
         """Submit this function for execution and return a Future."""
-        # TODO(1.5): actually submit to the runtime
-        return Future()
+        result = execute_task(self._func, args, kwargs)
+        return Future(result)
 
 
 def remote(func: Callable[..., Any]) -> RemoteFunction:

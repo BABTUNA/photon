@@ -4,11 +4,14 @@ from typing import Any
 
 
 class Future:
-    """A handle to a value that will be available later.
+    """A handle to a value produced by a remote function call.
 
-    Currently a stub — ``get()`` raises until the runtime is wired in.
+    For now the value is materialized eagerly when the Future is constructed.
+    Once async execution lands, ``get()`` will block until the value is ready.
     """
 
+    def __init__(self, value: Any) -> None:
+        self._value = value
+
     def get(self) -> Any:
-        # TODO(1.5): block until result is ready, then return it
-        raise NotImplementedError("Future.get() is not implemented yet")
+        return self._value
