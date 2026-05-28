@@ -24,8 +24,8 @@ class RemoteFunction:
 
     def remote(self, *args: Any, **kwargs: Any) -> Future:
         """Submit this function for execution and return a Future."""
-        result = execute_task(self._func, args, kwargs)
-        return Future(result)
+        handle = execute_task(self._func, args, kwargs)
+        return Future(handle)
 
 
 def remote(func: Callable[..., Any]) -> RemoteFunction:

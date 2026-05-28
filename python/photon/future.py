@@ -2,16 +2,18 @@
 
 from typing import Any
 
+from photon._native import TaskHandle
+
 
 class Future:
     """A handle to a value produced by a remote function call.
 
-    For now the value is materialized eagerly when the Future is constructed.
-    Once async execution lands, ``get()`` will block until the value is ready.
+    Wraps a Rust-side ``TaskHandle``. ``get()`` blocks until the underlying
+    worker thread finishes and returns the result.
     """
 
-    def __init__(self, value: Any) -> None:
-        self._value = value
+    def __init__(self, handle: TaskHandle) -> None:
+        self._handle = handle
 
     def get(self) -> Any:
-        return self._value
+        return self._handle.get()

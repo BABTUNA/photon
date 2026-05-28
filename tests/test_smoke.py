@@ -34,7 +34,8 @@ def test_direct_call_raises():
 
 
 def test_exception_propagates():
-    # Currently exceptions surface at .remote() (synchronous execution).
-    # This will flip to .get() once Tokio lands.
+    # Exceptions surface at .get(), not .remote(), because execution is
+    # deferred onto the Tokio blocking pool.
+    ref = boom.remote()
     with pytest.raises(ValueError):
-        boom.remote()
+        ref.get()
