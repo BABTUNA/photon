@@ -1,6 +1,6 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::PyBytes;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use tokio::runtime::Runtime;
@@ -35,19 +35,19 @@ fn runtime() -> &'static Runtime {
 
 /// Handle to a task running on the Tokio blocking pool.
 ///
-/// Internally holds a one-shot mpsc receiver that delivers the task's
-/// result once the worker thread finishes. `get()` may only be called once.
+/// Internally holds a one-shot mpsc receiver that delivers the pickled
+/// result bytes once the worker thread finishes. `get()` may only be called once.
 #[pyclass]
 struct TaskHandle {
-    receiver: Mutex<Option<mpsc::Receiver<PyResult<PyObject>>>>,
+    receiver: Mutex<Option<mpsc::Receiver<PyResult<Vec<u8>>>>>,
 }
 
 #[pymethods]
 impl TaskHandle {
-    /// Block until the task completes, then return its result.
+    /// Block until the task completes, then return the pickled result bytes.
     ///
     /// Releases the GIL while waiting so the worker thread can acquire it.
-    fn get(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn get<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let receiver = self
             .receiver
             .lock()
@@ -55,25 +55,28 @@ impl TaskHandle {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("get() may only be called once"))?;
 
-        py.allow_threads(move || receiver.recv())
-            .map_err(|_| PyRuntimeError::new_err("task worker disconnected"))?
+        let bytes_vec: Vec<u8> = py
+            .allow_threads(move || receiver.recv())
+            .map_err(|_| PyRuntimeError::new_err("task worker disconnected"))??;
+        Ok(PyBytes::new_bound(py, &bytes_vec))
     }
 }
 
-/// Submit a Python callable to the Tokio blocking pool.
+/// Submit a pickled (func, args, kwargs) payload to the Tokio blocking pool.
 ///
-/// Returns a `TaskHandle` that resolves to the callable's result via `.get()`.
-/// The callable runs on a worker thread which acquires the GIL when ready.
+/// The worker imports `photon._worker.run_pickled_task`, which unpickles
+/// the payload, runs the callable, and returns the pickled result.
 #[pyfunction]
-fn execute_task(func: Py<PyAny>, args: Py<PyTuple>, kwargs: Py<PyDict>) -> PyResult<TaskHandle> {
+fn execute_task(payload: Vec<u8>) -> PyResult<TaskHandle> {
     let (sender, receiver) = mpsc::channel();
 
     runtime().spawn_blocking(move || {
-        let result = Python::with_gil(|py| {
-            let func = func.bind(py);
-            let args = args.bind(py);
-            let kwargs = kwargs.bind(py);
-            func.call(args, Some(kwargs)).map(|b| b.unbind())
+        let result = Python::with_gil(|py| -> PyResult<Vec<u8>> {
+            let worker = py.import_bound("photon._worker")?;
+            let result_obj = worker
+                .getattr("run_pickled_task")?
+                .call1((payload.as_slice(),))?;
+            result_obj.extract()
         });
         let _ = sender.send(result);
     });

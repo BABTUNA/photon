@@ -2,6 +2,8 @@
 
 from typing import Any, Callable
 
+import cloudpickle
+
 from photon._native import execute_task
 from photon.future import Future
 
@@ -23,8 +25,9 @@ class RemoteFunction:
         )
 
     def remote(self, *args: Any, **kwargs: Any) -> Future:
-        """Submit this function for execution and return a Future."""
-        handle = execute_task(self._func, args, kwargs)
+        """Pickle the function and its args, hand the payload to the runtime."""
+        payload = cloudpickle.dumps((self._func, args, kwargs))
+        handle = execute_task(payload)
         return Future(handle)
 
 
