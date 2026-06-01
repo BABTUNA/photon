@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod api;
+mod object_store;
 mod runtime;
 
 /// Native Rust extension for photon.
