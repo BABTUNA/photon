@@ -5,12 +5,12 @@
 //! the mmap-backed implementation is being built out.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// 32-byte object identifier.
+/// 32-byte object identifier — blake3 hash of the payload bytes.
 ///
-/// Currently sequential. Becomes a blake3 content hash in commit 2.5.
+/// Content addressing means two identical payloads share an ID; the store
+/// dedupes implicitly.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ObjectId(pub(crate) [u8; 32]);
 
@@ -28,18 +28,16 @@ pub(crate) trait ObjectStore {
 
 /// In-memory baseline implementation of [`ObjectStore`].
 ///
-/// Holds payloads in a HashMap; assigns sequential IDs from an atomic counter.
-/// Useful as a reference while the mmap-backed store is built; will eventually
-/// stay around for tests against code that depends on the trait.
+/// Holds payloads in a HashMap keyed by their blake3 content hash. Useful as
+/// a reference while the mmap-backed store is built; stays around for tests
+/// against code that depends on the trait.
 pub(crate) struct InMemoryObjectStore {
-    next_id: AtomicU64,
     objects: Mutex<HashMap<ObjectId, Vec<u8>>>,
 }
 
 impl InMemoryObjectStore {
     pub(crate) fn new() -> Self {
         Self {
-            next_id: AtomicU64::new(0),
             objects: Mutex::new(HashMap::new()),
         }
     }
@@ -53,10 +51,7 @@ impl Default for InMemoryObjectStore {
 
 impl ObjectStore for InMemoryObjectStore {
     fn put(&self, payload: Vec<u8>) -> ObjectId {
-        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut bytes = [0u8; 32];
-        bytes[..8].copy_from_slice(&n.to_le_bytes());
-        let id = ObjectId(bytes);
+        let id = ObjectId(*blake3::hash(&payload).as_bytes());
         self.objects.lock().unwrap().insert(id, payload);
         id
     }
@@ -90,10 +85,18 @@ mod tests {
     }
 
     #[test]
-    fn sequential_ids_are_unique() {
+    fn different_payloads_get_different_ids() {
         let store = InMemoryObjectStore::new();
         let id1 = store.put(vec![1]);
         let id2 = store.put(vec![2]);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn identical_payloads_get_identical_ids() {
+        let store = InMemoryObjectStore::new();
+        let id1 = store.put(vec![1, 2, 3]);
+        let id2 = store.put(vec![1, 2, 3]);
+        assert_eq!(id1, id2);
     }
 }
