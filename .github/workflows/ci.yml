@@ -26,10 +26,13 @@ jobs:
       - name: Cargo check
         run: cargo check --all-targets
 
+      - name: Cargo test
+        run: cargo test --lib
+
       - name: Build and install photon
         run: |
           python -m pip install --upgrade pip
           pip install ".[dev]"
 
-      - name: Run tests
+      - name: Run pytest
         run: pytest tests/ -v
