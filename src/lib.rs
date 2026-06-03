@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 mod api;
 mod object_store;
 mod runtime;
+mod segment_allocator;
 
 /// Native Rust extension for photon.
 ///
