@@ -98,3 +98,59 @@ impl SegmentAllocator {
         self.capacity
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_allocator(capacity: usize) -> (TempDir, SegmentAllocator) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segment");
+        let alloc = SegmentAllocator::new(&path, capacity).unwrap();
+        (dir, alloc)
+    }
+
+    #[test]
+    fn small_allocation_is_page_aligned() {
+        let (_dir, alloc) = make_allocator(PAGE_SIZE * 4);
+        let off = alloc.allocate(100).unwrap();
+        assert_eq!(off, 0);
+        assert_eq!(off % PAGE_SIZE, 0);
+    }
+
+    #[test]
+    fn sequential_allocations_dont_overlap() {
+        let (_dir, alloc) = make_allocator(PAGE_SIZE * 4);
+        let a = alloc.allocate(100).unwrap();
+        let b = alloc.allocate(100).unwrap();
+        let c = alloc.allocate(100).unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, PAGE_SIZE);
+        assert_eq!(c, PAGE_SIZE * 2);
+    }
+
+    #[test]
+    fn allocation_larger_than_a_page_takes_multiple_pages() {
+        let (_dir, alloc) = make_allocator(PAGE_SIZE * 4);
+        let a = alloc.allocate(PAGE_SIZE + 1).unwrap();
+        let b = alloc.allocate(100).unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, PAGE_SIZE * 2);
+    }
+
+    #[test]
+    fn allocation_at_exact_capacity_succeeds() {
+        let (_dir, alloc) = make_allocator(PAGE_SIZE);
+        let off = alloc.allocate(PAGE_SIZE).unwrap();
+        assert_eq!(off, 0);
+    }
+
+    #[test]
+    fn allocation_beyond_capacity_returns_none() {
+        let (_dir, alloc) = make_allocator(PAGE_SIZE * 2);
+        assert!(alloc.allocate(PAGE_SIZE).is_some());
+        assert!(alloc.allocate(PAGE_SIZE).is_some());
+        assert!(alloc.allocate(1).is_none());
+    }
+}
