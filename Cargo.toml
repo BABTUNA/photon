@@ -5,3 +5,7 @@ members = ["crates/engine"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.94"
+
+[workspace.dependencies]
+arrow = { version = "59.1.0", features = ["prettyprint"] }
+parquet = "59.1.0"
