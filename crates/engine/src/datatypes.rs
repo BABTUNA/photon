@@ -101,6 +101,46 @@ impl ColumnVector for ArrowFieldVector {
     }
 }
 
+/// A scalar pretending to be a column: every row reads the same value.
+///
+/// Physical literal expressions (commit 2.4) return this so a constant in
+/// e.g. `price * 0.9` is stored once, not materialized into an N-row array.
+pub struct LiteralValueVector {
+    data_type: DataType,
+    value: Option<ScalarValue>,
+    size: usize,
+}
+
+impl LiteralValueVector {
+    /// `value: None` makes a column of NULLs.
+    pub fn new(data_type: DataType, value: Option<ScalarValue>, size: usize) -> Self {
+        Self {
+            data_type,
+            value,
+            size,
+        }
+    }
+}
+
+impl ColumnVector for LiteralValueVector {
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn value(&self, i: usize) -> Option<ScalarValue> {
+        assert!(
+            i < self.size,
+            "row {i} out of bounds for column of {} rows",
+            self.size
+        );
+        self.value.clone()
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +173,29 @@ mod tests {
         let array = Int64Array::from(vec![1]);
         let col = ArrowFieldVector::new(Arc::new(array));
         col.value(1);
+    }
+
+    #[test]
+    fn literal_vector_repeats_one_value() {
+        let col = LiteralValueVector::new(DataType::Int64, Some(ScalarValue::Int64(7)), 1000);
+
+        assert_eq!(col.size(), 1000);
+        assert_eq!(col.data_type(), &DataType::Int64);
+        assert_eq!(col.value(0), Some(ScalarValue::Int64(7)));
+        assert_eq!(col.value(999), Some(ScalarValue::Int64(7)));
+    }
+
+    #[test]
+    fn literal_vector_of_nulls() {
+        let col = LiteralValueVector::new(DataType::Utf8, None, 3);
+        assert_eq!(col.value(2), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn literal_vector_panics_past_the_end() {
+        let col = LiteralValueVector::new(DataType::Int64, Some(ScalarValue::Int64(7)), 2);
+        col.value(2);
     }
 
     #[test]
