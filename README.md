@@ -1,43 +1,12 @@
-# photon
+# mini-multibase
 
-A small distributed Python runtime, built in Rust + PyO3 to understand the abstractions Ray provides. If Ray is a beam, photon is the smallest unit of one.
+A distributed query engine in Rust, specialized for multimodal (video + sensor) data.
 
-## Status
+This repo previously hosted **photon**, a mini distributed Python runtime; that project lives in the git history prior to this commit.
 
-Early work in progress.
+## What's being built
 
-## Requirements
+- **Part 1:** a Rust replica of the query engine from [How Query Engines Work](https://howqueryengineswork.com/) — Arrow-based type system, logical/physical plans, DataFrame + SQL frontends, optimizer — plus a distributed layer: scheduler/workers over gRPC, an Arrow Flight data plane, hash-partitioned shuffle, and OTEL/Jaeger tracing.
+- **Part 2:** specialization into a mini **MultiBase** — a multimodal table where video frames and sensor rows live timestamp-aligned in one dataset, semantic clip search in plain English (CLIP embeddings + distributed top-k), an ASOF join, and query results served over Arrow Flight into PyTorch tensors.
 
-- Rust 1.75+ (stable)
-- Python 3.10+
-- Linux or macOS (no Windows support — uses `mmap` and Unix sockets)
-
-## Build
-
-First-time setup:
-
-```sh
-python3 -m venv .venv
-source .venv/bin/activate
-pip install maturin
-maturin develop
-```
-
-Iterate (after the venv exists and is activated):
-
-```sh
-maturin develop
-```
-
-`maturin develop` compiles the Rust extension and installs it into the active venv as an editable package. Re-run it after any change to Rust source.
-
-## Usage
-
-```python
-import photon
-
-print(photon.hello("world"))
-# Hello from photon, world!
-```
-
-More to come.
+Status: repo reset — engine scaffolding lands next.
