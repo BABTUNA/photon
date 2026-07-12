@@ -10,8 +10,10 @@ use std::sync::Arc;
 use arrow::csv::ReaderBuilder;
 use arrow::csv::reader::Format;
 use arrow::datatypes::{Schema, SchemaRef};
+use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::datatypes::RecordBatch;
+use crate::datatypes::{RecordBatch, project_by_name};
 
 /// Map projection names to column indices in `schema`. Panics on unknown names.
 fn resolve_indices(schema: &Schema, projection: &[String]) -> Vec<usize> {
@@ -125,6 +127,79 @@ impl DataSource for CsvDataSource {
     }
 }
 
+/// Parquet file source. Unlike CSV, parquet is self-describing: the file
+/// footer holds the schema and per-row-group metadata, so `new` reads only
+/// the footer — no data pages.
+pub struct ParquetDataSource {
+    path: String,
+    schema: SchemaRef,
+    num_row_groups: usize,
+}
+
+impl ParquetDataSource {
+    pub fn new(path: impl Into<String>) -> Self {
+        let path = path.into();
+        let file = File::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap_or_else(|e| panic!("parquet footer of {path}: {e}"));
+        let schema = Arc::clone(builder.schema());
+        let num_row_groups = builder.metadata().num_row_groups();
+        Self {
+            path,
+            schema,
+            num_row_groups,
+        }
+    }
+
+    /// Row groups are parquet's internal horizontal partitions — and the
+    /// engine's unit of parallel (4.1) and distributed (5.2) work.
+    pub fn num_row_groups(&self) -> usize {
+        self.num_row_groups
+    }
+}
+
+impl DataSource for ParquetDataSource {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn scan(&self, projection: &[String]) -> Box<dyn Iterator<Item = RecordBatch>> {
+        let file = File::open(&self.path).unwrap_or_else(|e| panic!("open {}: {e}", self.path));
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap_or_else(|e| panic!("parquet footer of {}: {e}", self.path));
+        if projection.is_empty() {
+            let reader = builder.build().expect("parquet reader");
+            return Box::new(reader.map(|result| result.expect("parquet decode error").into()));
+        }
+        // ProjectionMask is a set: the reader skips unwanted column chunks on
+        // disk but returns columns in FILE order, not requested order.
+        let indices = resolve_indices(&self.schema, projection);
+        let mask = ProjectionMask::roots(builder.parquet_schema(), indices.iter().copied());
+        let reader = builder
+            .with_projection(mask)
+            .build()
+            .expect("parquet reader");
+        // Restore the requested order per batch (cheap: Arc shuffles only).
+        let names = projection.to_vec();
+        Box::new(reader.map(move |result| {
+            let batch: RecordBatch = result.expect("parquet decode error").into();
+            reorder_columns(&batch, &names)
+        }))
+    }
+}
+
+/// Rebuild `batch` with columns in exactly `names` order.
+fn reorder_columns(batch: &RecordBatch, names: &[String]) -> RecordBatch {
+    let schema = batch.schema();
+    let name_strs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let projected = Arc::new(project_by_name(&schema, &name_strs).unwrap());
+    let columns = names
+        .iter()
+        .map(|n| Arc::clone(batch.column(schema.index_of(n).unwrap())))
+        .collect();
+    RecordBatch::new(projected, columns)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +286,75 @@ mod tests {
             Some(ScalarValue::Utf8("Manager, Software".to_string()))
         );
         assert_eq!(batch.column(3).value(3), None);
+    }
+
+    /// Write a 5-row parquet file capped at 2 rows per row group → 3 groups.
+    fn write_test_parquet(name: &str) -> String {
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("city", DataType::Utf8, false),
+            Field::new("temp_c", DataType::Float64, false),
+        ]));
+        let batch = ArrowRecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0])),
+            ],
+        )
+        .unwrap();
+
+        let path = std::env::temp_dir().join(name);
+        let file = File::create(&path).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn parquet_reads_schema_and_row_groups_from_footer() {
+        let path = write_test_parquet("engine_test_footer.parquet");
+        let source = ParquetDataSource::new(&path);
+
+        assert_eq!(source.schema().field(0).name(), "id");
+        assert_eq!(source.schema().field(2).data_type(), &DataType::Float64);
+        assert_eq!(source.num_row_groups(), 3); // 5 rows / max 2 per group
+    }
+
+    #[test]
+    fn parquet_full_scan_yields_all_rows_across_row_groups() {
+        let path = write_test_parquet("engine_test_scan.parquet");
+        let source = ParquetDataSource::new(&path);
+
+        let batches: Vec<_> = source.scan(&[]).collect();
+        let total: usize = batches.iter().map(|b| b.row_count()).sum();
+        assert_eq!(total, 5);
+        assert_eq!(batches[0].column_count(), 3);
+    }
+
+    #[test]
+    fn parquet_projection_skips_and_reorders_columns() {
+        let path = write_test_parquet("engine_test_proj.parquet");
+        let source = ParquetDataSource::new(&path);
+
+        let batches: Vec<_> = source
+            .scan(&["temp_c".to_string(), "id".to_string()])
+            .collect();
+
+        let batch = &batches[0];
+        assert_eq!(batch.column_count(), 2);
+        assert_eq!(batch.schema().field(0).name(), "temp_c");
+        assert_eq!(batch.schema().field(1).name(), "id");
+        assert_eq!(batch.column(0).value(0), Some(ScalarValue::Float64(1.0)));
+        assert_eq!(batch.column(1).value(0), Some(ScalarValue::Int64(1)));
     }
 
     #[test]
