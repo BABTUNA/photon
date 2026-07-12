@@ -27,7 +27,7 @@ fn resolve_indices(schema: &Schema, projection: &[String]) -> Vec<usize> {
         .collect()
 }
 
-pub trait DataSource {
+pub trait DataSource: Send + Sync {
     /// The full schema of the underlying data, before any projection.
     fn schema(&self) -> SchemaRef;
 

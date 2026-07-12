@@ -35,7 +35,10 @@ pub enum ScalarValue {
 }
 
 /// A read-only column, `size()` rows long.
-pub trait ColumnVector {
+///
+/// `Send + Sync` so columns (and everything holding them) can be shared
+/// across threads — parallel execution arrives in W4.
+pub trait ColumnVector: Send + Sync {
     fn data_type(&self) -> &DataType;
 
     /// Value at row `i`; `None` means SQL NULL.
