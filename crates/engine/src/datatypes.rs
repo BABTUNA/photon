@@ -150,6 +150,8 @@ impl ColumnVector for LiteralValueVector {
 ///
 /// Mirrors arrow's `RecordBatch`, but the columns are `dyn ColumnVector`, so
 /// a literal column travels through operators exactly like an arrow-backed one.
+/// Cloning is cheap: the schema and every column are behind `Arc`s.
+#[derive(Clone)]
 pub struct RecordBatch {
     schema: SchemaRef,
     columns: Vec<Arc<dyn ColumnVector>>,
