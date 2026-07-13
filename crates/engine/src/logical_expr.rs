@@ -24,6 +24,87 @@ pub enum LogicalExpr {
     Column(String),
     /// A constant.
     Literal(ScalarValue),
+    /// Two sub-expressions combined by an operator: `#a > 4`, `#x AND #y`.
+    BinaryExpr {
+        left: Box<LogicalExpr>,
+        op: Operator,
+        right: Box<LogicalExpr>,
+    },
+}
+
+/// The operator taxonomy: three families with different result types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operator {
+    // comparisons — result is Boolean, operands any comparable type
+    Eq,
+    Neq,
+    Gt,
+    GtEq,
+    Lt,
+    LtEq,
+    // boolean algebra — Boolean in, Boolean out
+    And,
+    Or,
+    // math — result keeps the (left) operand's type
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulus,
+}
+
+impl Operator {
+    /// Short name, used as the output field name (book convention).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Operator::Eq => "eq",
+            Operator::Neq => "neq",
+            Operator::Gt => "gt",
+            Operator::GtEq => "gteq",
+            Operator::Lt => "lt",
+            Operator::LtEq => "lteq",
+            Operator::And => "and",
+            Operator::Or => "or",
+            Operator::Add => "add",
+            Operator::Subtract => "subtract",
+            Operator::Multiply => "mult",
+            Operator::Divide => "div",
+            Operator::Modulus => "mod",
+        }
+    }
+
+    /// Comparisons and boolean algebra produce Boolean; math does not.
+    pub fn produces_boolean(&self) -> bool {
+        !matches!(
+            self,
+            Operator::Add
+                | Operator::Subtract
+                | Operator::Multiply
+                | Operator::Divide
+                | Operator::Modulus
+        )
+    }
+}
+
+impl Display for Operator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let symbol = match self {
+            Operator::Eq => "=",
+            Operator::Neq => "!=",
+            Operator::Gt => ">",
+            Operator::GtEq => ">=",
+            Operator::Lt => "<",
+            Operator::LtEq => "<=",
+            Operator::And => "AND",
+            Operator::Or => "OR",
+            Operator::Add => "+",
+            Operator::Subtract => "-",
+            Operator::Multiply => "*",
+            Operator::Divide => "/",
+            Operator::Modulus => "%",
+        };
+        write!(f, "{symbol}")
+    }
 }
 
 /// Reference a column: `col("salary")`.
@@ -54,7 +135,71 @@ impl LogicalExpr {
                 };
                 Field::new(name, value.data_type(), true)
             }
+            LogicalExpr::BinaryExpr { left, op, .. } => {
+                if op.produces_boolean() {
+                    Field::new(op.name(), arrow::datatypes::DataType::Boolean, true)
+                } else {
+                    // Book convention: a math expression's type follows its
+                    // left operand. Real coercion happens physically (2.5).
+                    Field::new(op.name(), left.to_field(input).data_type().clone(), true)
+                }
+            }
         }
+    }
+
+    fn binary(self, op: Operator, rhs: LogicalExpr) -> LogicalExpr {
+        LogicalExpr::BinaryExpr {
+            left: Box::new(self),
+            op,
+            right: Box::new(rhs),
+        }
+    }
+}
+
+/// Fluent builders: `col("salary").gt(lit(4000)).and(col("state").eq(lit("CO")))`.
+///
+/// Some names shadow std traits (`eq`, `add`, ...) — intentional, these are
+/// expression-tree constructors, not implementations of those traits.
+#[allow(clippy::should_implement_trait)]
+impl LogicalExpr {
+    pub fn eq(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::Eq, rhs)
+    }
+    pub fn neq(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::Neq, rhs)
+    }
+    pub fn gt(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::Gt, rhs)
+    }
+    pub fn gt_eq(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::GtEq, rhs)
+    }
+    pub fn lt(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::Lt, rhs)
+    }
+    pub fn lt_eq(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::LtEq, rhs)
+    }
+    pub fn and(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::And, rhs)
+    }
+    pub fn or(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::Or, rhs)
+    }
+    pub fn add(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::Add, rhs)
+    }
+    pub fn subtract(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::Subtract, rhs)
+    }
+    pub fn multiply(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::Multiply, rhs)
+    }
+    pub fn divide(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::Divide, rhs)
+    }
+    pub fn modulus(self, rhs: LogicalExpr) -> LogicalExpr {
+        self.binary(Operator::Modulus, rhs)
     }
 }
 
@@ -63,6 +208,7 @@ impl Display for LogicalExpr {
         match self {
             LogicalExpr::Column(name) => write!(f, "#{name}"),
             LogicalExpr::Literal(value) => write!(f, "{value}"),
+            LogicalExpr::BinaryExpr { left, op, right } => write!(f, "{left} {op} {right}"),
         }
     }
 }
@@ -111,5 +257,38 @@ mod tests {
         assert_eq!(col("id").to_string(), "#id");
         assert_eq!(lit(4i64).to_string(), "4");
         assert_eq!(lit("CO").to_string(), "'CO'");
+    }
+
+    #[test]
+    fn comparisons_produce_boolean_fields() {
+        let expr = col("salary").gt(lit(4000i64));
+        let field = expr.to_field(&employee_scan());
+        assert_eq!(field.name(), "gt");
+        assert_eq!(field.data_type(), &DataType::Boolean);
+    }
+
+    #[test]
+    fn math_keeps_the_left_operand_type() {
+        let expr = col("salary").multiply(lit(2i64));
+        let field = expr.to_field(&employee_scan());
+        assert_eq!(field.name(), "mult");
+        assert_eq!(field.data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn builders_nest_and_display_readably() {
+        let expr = col("state")
+            .eq(lit("CO"))
+            .and(col("salary").gt_eq(lit(10000i64)));
+        assert_eq!(expr.to_string(), "#state = 'CO' AND #salary >= 10000");
+    }
+
+    #[test]
+    fn boolean_algebra_type_checks_over_comparisons() {
+        let expr = col("salary").lt(lit(1i64)).or(col("salary").gt(lit(2i64)));
+        assert_eq!(
+            expr.to_field(&employee_scan()).data_type(),
+            &DataType::Boolean
+        );
     }
 }
