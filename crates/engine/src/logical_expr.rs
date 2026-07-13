@@ -213,6 +213,94 @@ impl Display for LogicalExpr {
     }
 }
 
+/// Which aggregate function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunc {
+    Sum,
+    Min,
+    Max,
+    Avg,
+    Count,
+}
+
+impl AggregateFunc {
+    pub fn name(&self) -> &'static str {
+        match self {
+            AggregateFunc::Sum => "SUM",
+            AggregateFunc::Min => "MIN",
+            AggregateFunc::Max => "MAX",
+            AggregateFunc::Avg => "AVG",
+            AggregateFunc::Count => "COUNT",
+        }
+    }
+}
+
+/// An aggregate over an input expression: `SUM(#salary)`.
+///
+/// Deliberately NOT a `LogicalExpr` variant: aggregates collapse many rows
+/// into one, so they only make sense inside an Aggregate plan node (1.15).
+/// Keeping them a separate type makes "aggregates only appear in Aggregate
+/// nodes" a compile-time guarantee instead of a planner-time check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateExpr {
+    pub func: AggregateFunc,
+    pub expr: LogicalExpr,
+}
+
+impl AggregateExpr {
+    pub fn to_field(&self, input: &dyn LogicalPlan) -> Field {
+        use arrow::datatypes::DataType;
+        let data_type = match self.func {
+            // COUNT is a row count whatever it counts.
+            AggregateFunc::Count => DataType::Int64,
+            // AVG of integers is fractional (deviation: the book keeps the
+            // operand type, which would truncate at execution time).
+            AggregateFunc::Avg => DataType::Float64,
+            // SUM/MIN/MAX keep the operand's type.
+            _ => self.expr.to_field(input).data_type().clone(),
+        };
+        Field::new(self.func.name(), data_type, true)
+    }
+}
+
+impl Display for AggregateExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}({})", self.func.name(), self.expr)
+    }
+}
+
+/// `sum(col("salary"))`, `count(col("id"))`, ...
+pub fn sum(expr: LogicalExpr) -> AggregateExpr {
+    AggregateExpr {
+        func: AggregateFunc::Sum,
+        expr,
+    }
+}
+pub fn min(expr: LogicalExpr) -> AggregateExpr {
+    AggregateExpr {
+        func: AggregateFunc::Min,
+        expr,
+    }
+}
+pub fn max(expr: LogicalExpr) -> AggregateExpr {
+    AggregateExpr {
+        func: AggregateFunc::Max,
+        expr,
+    }
+}
+pub fn avg(expr: LogicalExpr) -> AggregateExpr {
+    AggregateExpr {
+        func: AggregateFunc::Avg,
+        expr,
+    }
+}
+pub fn count(expr: LogicalExpr) -> AggregateExpr {
+    AggregateExpr {
+        func: AggregateFunc::Count,
+        expr,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +377,32 @@ mod tests {
         assert_eq!(
             expr.to_field(&employee_scan()).data_type(),
             &DataType::Boolean
+        );
+    }
+
+    #[test]
+    fn aggregate_field_types_follow_the_function() {
+        let scan = employee_scan();
+
+        let s = sum(col("salary")).to_field(&scan);
+        assert_eq!((s.name().as_str(), s.data_type()), ("SUM", &DataType::Int64));
+
+        let c = count(col("state")).to_field(&scan);
+        assert_eq!((c.name().as_str(), c.data_type()), ("COUNT", &DataType::Int64));
+
+        let a = avg(col("salary")).to_field(&scan);
+        assert_eq!((a.name().as_str(), a.data_type()), ("AVG", &DataType::Float64));
+
+        let m = min(col("first_name")).to_field(&scan);
+        assert_eq!((m.name().as_str(), m.data_type()), ("MIN", &DataType::Utf8));
+    }
+
+    #[test]
+    fn aggregates_display_like_sql() {
+        assert_eq!(sum(col("salary")).to_string(), "SUM(#salary)");
+        assert_eq!(
+            max(col("salary").multiply(lit(2i64))).to_string(),
+            "MAX(#salary * 2)"
         );
     }
 }
