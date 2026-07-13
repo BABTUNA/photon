@@ -34,6 +34,79 @@ pub enum ScalarValue {
     Utf8(String),
 }
 
+impl ScalarValue {
+    /// The arrow type this value belongs to.
+    pub fn data_type(&self) -> DataType {
+        match self {
+            ScalarValue::Boolean(_) => DataType::Boolean,
+            ScalarValue::Int8(_) => DataType::Int8,
+            ScalarValue::Int16(_) => DataType::Int16,
+            ScalarValue::Int32(_) => DataType::Int32,
+            ScalarValue::Int64(_) => DataType::Int64,
+            ScalarValue::UInt8(_) => DataType::UInt8,
+            ScalarValue::UInt16(_) => DataType::UInt16,
+            ScalarValue::UInt32(_) => DataType::UInt32,
+            ScalarValue::UInt64(_) => DataType::UInt64,
+            ScalarValue::Float32(_) => DataType::Float32,
+            ScalarValue::Float64(_) => DataType::Float64,
+            ScalarValue::Utf8(_) => DataType::Utf8,
+        }
+    }
+}
+
+impl std::fmt::Display for ScalarValue {
+    /// How a value prints inside expressions and plans: strings quoted,
+    /// everything else bare — `'CO'`, `4`, `1.5`, `true`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScalarValue::Boolean(v) => write!(f, "{v}"),
+            ScalarValue::Int8(v) => write!(f, "{v}"),
+            ScalarValue::Int16(v) => write!(f, "{v}"),
+            ScalarValue::Int32(v) => write!(f, "{v}"),
+            ScalarValue::Int64(v) => write!(f, "{v}"),
+            ScalarValue::UInt8(v) => write!(f, "{v}"),
+            ScalarValue::UInt16(v) => write!(f, "{v}"),
+            ScalarValue::UInt32(v) => write!(f, "{v}"),
+            ScalarValue::UInt64(v) => write!(f, "{v}"),
+            ScalarValue::Float32(v) => write!(f, "{v}"),
+            ScalarValue::Float64(v) => write!(f, "{v}"),
+            ScalarValue::Utf8(v) => write!(f, "'{v}'"),
+        }
+    }
+}
+
+/// Conversions powering `lit(...)`: `lit(4)`, `lit(1.5)`, `lit("CO")`.
+impl From<i32> for ScalarValue {
+    fn from(v: i32) -> Self {
+        ScalarValue::Int32(v)
+    }
+}
+impl From<i64> for ScalarValue {
+    fn from(v: i64) -> Self {
+        ScalarValue::Int64(v)
+    }
+}
+impl From<f64> for ScalarValue {
+    fn from(v: f64) -> Self {
+        ScalarValue::Float64(v)
+    }
+}
+impl From<bool> for ScalarValue {
+    fn from(v: bool) -> Self {
+        ScalarValue::Boolean(v)
+    }
+}
+impl From<&str> for ScalarValue {
+    fn from(v: &str) -> Self {
+        ScalarValue::Utf8(v.to_string())
+    }
+}
+impl From<String> for ScalarValue {
+    fn from(v: String) -> Self {
+        ScalarValue::Utf8(v)
+    }
+}
+
 /// A read-only column, `size()` rows long.
 ///
 /// `Send + Sync` so columns (and everything holding them) can be shared
