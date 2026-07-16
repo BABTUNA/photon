@@ -9,3 +9,5 @@ pub mod datatypes;
 pub mod execution;
 pub mod logical_expr;
 pub mod logical_plan;
+pub mod physical_expr;
+pub mod physical_plan;
