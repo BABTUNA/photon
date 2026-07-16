@@ -24,6 +24,11 @@ pub trait LogicalPlan: Display + Send + Sync {
 
     /// The nodes this one consumes. Empty for leaves.
     fn children(&self) -> Vec<Arc<dyn LogicalPlan>>;
+
+    /// Escape hatch for the query planner (2.8), which must recover the
+    /// concrete node type from a `dyn LogicalPlan` to translate it —
+    /// Kotlin's `when (plan) is Scan -> ...` spelled in Rust.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Leaf node: read `projection` columns from a data source. The only node
@@ -76,6 +81,10 @@ impl LogicalPlan for Scan {
     fn children(&self) -> Vec<Arc<dyn LogicalPlan>> {
         vec![]
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Compute new columns from the input: `SELECT a, b * 2`.
@@ -112,6 +121,10 @@ impl LogicalPlan for Projection {
     fn children(&self) -> Vec<Arc<dyn LogicalPlan>> {
         vec![Arc::clone(&self.input)]
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Keep only rows where `expr` is true: `WHERE state = 'CO'`.
@@ -140,6 +153,10 @@ impl LogicalPlan for Selection {
 
     fn children(&self) -> Vec<Arc<dyn LogicalPlan>> {
         vec![Arc::clone(&self.input)]
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -192,6 +209,10 @@ impl LogicalPlan for Aggregate {
 
     fn children(&self) -> Vec<Arc<dyn LogicalPlan>> {
         vec![Arc::clone(&self.input)]
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
