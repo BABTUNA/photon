@@ -14,7 +14,7 @@ use arrow::array::{BooleanArray, Float64Array, Int64Array};
 use arrow::datatypes::DataType;
 
 use crate::datatypes::{ArrowFieldVector, ColumnVector, LiteralValueVector, RecordBatch, ScalarValue};
-use crate::logical_expr::Operator;
+use crate::logical_expr::{AggregateFunc, Operator};
 
 pub trait Expression: Display + Send + Sync {
     /// Evaluate against `input`, producing a column with one value per row.
@@ -210,6 +210,138 @@ fn float_math(a: f64, b: f64, op: Operator) -> f64 {
         Operator::Divide => a / b,
         Operator::Modulus => a % b,
         other => unreachable!("{other} is not math"),
+    }
+}
+
+/// Physical aggregate: which function, over which input expression.
+/// Not an `Expression` — it doesn't map a batch to a column; it feeds
+/// accumulators inside HashAggregateExec, one per group.
+pub struct AggregateExpression {
+    pub func: AggregateFunc,
+    pub expr: Arc<dyn Expression>,
+}
+
+impl AggregateExpression {
+    pub fn create_accumulator(&self) -> Box<dyn Accumulator> {
+        match self.func {
+            AggregateFunc::Sum => Box::new(SumAccumulator { sum: None }),
+            AggregateFunc::Min => Box::new(MinMaxAccumulator {
+                current: None,
+                keep_if: Operator::Lt,
+            }),
+            AggregateFunc::Max => Box::new(MinMaxAccumulator {
+                current: None,
+                keep_if: Operator::Gt,
+            }),
+            AggregateFunc::Avg => Box::new(AvgAccumulator { sum: 0.0, count: 0 }),
+            AggregateFunc::Count => Box::new(CountAccumulator { count: 0 }),
+        }
+    }
+}
+
+impl Display for AggregateExpression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}({})", self.func.name(), self.expr)
+    }
+}
+
+/// Running state for one aggregate within one group. SQL semantics: NULL
+/// inputs are skipped, never accumulated.
+pub trait Accumulator: Send {
+    fn accumulate(&mut self, value: Option<ScalarValue>);
+    fn final_value(&self) -> Option<ScalarValue>;
+}
+
+/// MIN and MAX are the same machine with the comparison flipped.
+struct MinMaxAccumulator {
+    current: Option<ScalarValue>,
+    keep_if: Operator,
+}
+
+impl Accumulator for MinMaxAccumulator {
+    fn accumulate(&mut self, value: Option<ScalarValue>) {
+        let Some(v) = value else { return };
+        match &self.current {
+            None => self.current = Some(v),
+            Some(c) => {
+                if compare(&v, c, self.keep_if) {
+                    self.current = Some(v);
+                }
+            }
+        }
+    }
+
+    fn final_value(&self) -> Option<ScalarValue> {
+        self.current.clone()
+    }
+}
+
+/// Sums integers in i64 and floats in f64; promotes to float if a float
+/// ever shows up. Empty (or all-NULL) input sums to NULL, per SQL.
+struct SumAccumulator {
+    sum: Option<ScalarValue>,
+}
+
+impl Accumulator for SumAccumulator {
+    fn accumulate(&mut self, value: Option<ScalarValue>) {
+        let Some(v) = value else { return };
+        let float = is_float(&v.data_type());
+        match &mut self.sum {
+            None => {
+                self.sum = Some(if float {
+                    ScalarValue::Float64(as_f64(&v))
+                } else {
+                    ScalarValue::Int64(as_i64(&v))
+                })
+            }
+            Some(ScalarValue::Int64(s)) => {
+                if float {
+                    self.sum = Some(ScalarValue::Float64(*s as f64 + as_f64(&v)));
+                } else {
+                    *s += as_i64(&v);
+                }
+            }
+            Some(ScalarValue::Float64(s)) => *s += as_f64(&v),
+            Some(other) => unreachable!("sum state is always Int64/Float64, got {other}"),
+        }
+    }
+
+    fn final_value(&self) -> Option<ScalarValue> {
+        self.sum.clone()
+    }
+}
+
+struct AvgAccumulator {
+    sum: f64,
+    count: i64,
+}
+
+impl Accumulator for AvgAccumulator {
+    fn accumulate(&mut self, value: Option<ScalarValue>) {
+        let Some(v) = value else { return };
+        self.sum += as_f64(&v);
+        self.count += 1;
+    }
+
+    fn final_value(&self) -> Option<ScalarValue> {
+        (self.count > 0).then(|| ScalarValue::Float64(self.sum / self.count as f64))
+    }
+}
+
+/// COUNT(expr): number of non-NULL values.
+struct CountAccumulator {
+    count: i64,
+}
+
+impl Accumulator for CountAccumulator {
+    fn accumulate(&mut self, value: Option<ScalarValue>) {
+        if value.is_some() {
+            self.count += 1;
+        }
+    }
+
+    fn final_value(&self) -> Option<ScalarValue> {
+        Some(ScalarValue::Int64(self.count))
     }
 }
 
