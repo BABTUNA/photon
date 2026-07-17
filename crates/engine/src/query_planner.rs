@@ -8,11 +8,13 @@
 use std::sync::Arc;
 
 use crate::logical_expr::LogicalExpr;
-use crate::logical_plan::{Aggregate, LogicalPlan, Projection, Scan, Selection};
+use crate::logical_plan::{Aggregate, Join, LogicalPlan, Projection, Scan, Selection};
 use crate::physical_expr::{
     AggregateExpression, BinaryExpression, ColumnExpression, Expression, LiteralExpression,
 };
-use crate::physical_plan::{HashAggregateExec, PhysicalPlan, ProjectionExec, ScanExec, SelectionExec};
+use crate::physical_plan::{
+    HashAggregateExec, HashJoinExec, PhysicalPlan, ProjectionExec, ScanExec, SelectionExec,
+};
 
 /// Translate a logical plan into a runnable physical plan.
 pub fn create_physical_plan(plan: &dyn LogicalPlan) -> Arc<dyn PhysicalPlan> {
@@ -56,6 +58,28 @@ pub fn create_physical_plan(plan: &dyn LogicalPlan) -> Arc<dyn PhysicalPlan> {
             aggregate.schema(),
             group_exprs,
             aggregate_exprs,
+        ))
+    } else if let Some(join) = any.downcast_ref::<Join>() {
+        let left = create_physical_plan(join.left.as_ref());
+        let right = create_physical_plan(join.right.as_ref());
+        // Key names resolve against each SIDE's schema independently.
+        let left_keys = join
+            .on
+            .iter()
+            .map(|(l, _)| join.left.schema().index_of(l).unwrap())
+            .collect();
+        let right_keys = join
+            .on
+            .iter()
+            .map(|(_, r)| join.right.schema().index_of(r).unwrap())
+            .collect();
+        Arc::new(HashJoinExec::new(
+            left,
+            right,
+            join.join_type,
+            left_keys,
+            right_keys,
+            join.schema(),
         ))
     } else {
         panic!("query planner: unknown logical plan node: {plan}")

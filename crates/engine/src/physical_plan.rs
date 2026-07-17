@@ -19,6 +19,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 
 use crate::datasource::DataSource;
 use crate::datatypes::{ArrowFieldVector, ColumnVector, RecordBatch, ScalarValue, project_by_name};
+use crate::logical_plan::JoinType;
 use crate::physical_expr::{AggregateExpression, Expression};
 
 pub trait PhysicalPlan: Display + Send + Sync {
@@ -309,11 +310,163 @@ impl PhysicalPlan for HashAggregateExec {
     }
 }
 
+/// Classic two-phase hash join.
+///
+/// BUILD: drain the LEFT input into a hash table keyed on the join keys.
+/// PROBE: stream the RIGHT input, looking each row up in the table.
+/// Inner emits matches only; Left additionally emits unmatched build rows
+/// padded with NULLs; Right emits unmatched probe rows padded with NULLs.
+///
+/// SQL subtlety honored here: a NULL join key matches NOTHING — not even
+/// another NULL (unlike GROUP BY, where NULL keys group together).
+pub struct HashJoinExec {
+    pub left: Arc<dyn PhysicalPlan>,
+    pub right: Arc<dyn PhysicalPlan>,
+    pub join_type: JoinType,
+    pub left_keys: Vec<usize>,
+    pub right_keys: Vec<usize>,
+    schema: SchemaRef,
+}
+
+impl HashJoinExec {
+    pub fn new(
+        left: Arc<dyn PhysicalPlan>,
+        right: Arc<dyn PhysicalPlan>,
+        join_type: JoinType,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        schema: SchemaRef,
+    ) -> Self {
+        Self {
+            left,
+            right,
+            join_type,
+            left_keys,
+            right_keys,
+            schema,
+        }
+    }
+}
+
+impl Display for HashJoinExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let on: Vec<String> = self
+            .left_keys
+            .iter()
+            .zip(&self.right_keys)
+            .map(|(l, r)| format!("#{l} = #{r}"))
+            .collect();
+        write!(
+            f,
+            "HashJoinExec: type={:?}, on=[{}]",
+            self.join_type,
+            on.join(", ")
+        )
+    }
+}
+
+impl PhysicalPlan for HashJoinExec {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn execute(&self) -> Box<dyn Iterator<Item = RecordBatch>> {
+        // BUILD: materialize every left row; index the non-NULL-keyed ones.
+        let mut left_rows: Vec<Vec<Option<ScalarValue>>> = Vec::new();
+        let mut table: HashMap<GroupKey, Vec<usize>> = HashMap::new();
+        for batch in self.left.execute() {
+            for row in 0..batch.row_count() {
+                let values: Vec<_> = (0..batch.column_count())
+                    .map(|c| batch.column(c).value(row))
+                    .collect();
+                let key = GroupKey(self.left_keys.iter().map(|&k| values[k].clone()).collect());
+                if !key.has_null() {
+                    table.entry(key).or_default().push(left_rows.len());
+                }
+                left_rows.push(values);
+            }
+        }
+
+        let left_width = self.left.schema().fields().len();
+        let right_width = self.right.schema().fields().len();
+        let mut left_matched = vec![false; left_rows.len()];
+        let mut out_rows: Vec<Vec<Option<ScalarValue>>> = Vec::new();
+
+        // PROBE: stream the right side through the table.
+        for batch in self.right.execute() {
+            for row in 0..batch.row_count() {
+                let values: Vec<_> = (0..batch.column_count())
+                    .map(|c| batch.column(c).value(row))
+                    .collect();
+                let key = GroupKey(self.right_keys.iter().map(|&k| values[k].clone()).collect());
+                let matches = (!key.has_null()).then(|| table.get(&key)).flatten();
+                match matches {
+                    Some(indices) => {
+                        for &i in indices {
+                            left_matched[i] = true;
+                            let mut joined = left_rows[i].clone();
+                            joined.extend(values.iter().cloned());
+                            out_rows.push(joined);
+                        }
+                    }
+                    None => {
+                        if self.join_type == JoinType::Right {
+                            let mut joined = vec![None; left_width];
+                            joined.extend(values.iter().cloned());
+                            out_rows.push(joined);
+                        }
+                    }
+                }
+            }
+        }
+
+        // LEFT join: emit build rows nothing probed, padded on the right.
+        if self.join_type == JoinType::Left {
+            for (i, matched) in left_matched.iter().enumerate() {
+                if !matched {
+                    let mut joined = left_rows[i].clone();
+                    joined.extend(std::iter::repeat_n(None, right_width));
+                    out_rows.push(joined);
+                }
+            }
+        }
+
+        // Rows → columns → one output batch.
+        let n_cols = left_width + right_width;
+        let mut cols: Vec<Vec<Option<ScalarValue>>> = vec![Vec::with_capacity(out_rows.len()); n_cols];
+        for row in out_rows {
+            for (i, value) in row.into_iter().enumerate() {
+                cols[i].push(value);
+            }
+        }
+        let columns: Vec<_> = cols
+            .into_iter()
+            .zip(self.schema.fields())
+            .map(|(values, field)| build_column(values, field.data_type()))
+            .collect();
+        Box::new(std::iter::once(RecordBatch::new(
+            Arc::clone(&self.schema),
+            columns,
+        )))
+    }
+
+    fn children(&self) -> Vec<Arc<dyn PhysicalPlan>> {
+        vec![Arc::clone(&self.left), Arc::clone(&self.right)]
+    }
+}
+
 /// Hash-map key over group values. `ScalarValue` is only `PartialEq`
 /// (floats: NaN != NaN), so it can't be a key directly — this wrapper
 /// compares and hashes floats BY BITS: NaN groups with NaN, and 0.0 / -0.0
 /// land in different groups. Both fine for a learning engine; noted.
 struct GroupKey(Vec<Option<ScalarValue>>);
+
+impl GroupKey {
+    /// Joins need this: SQL says a NULL key equals nothing.
+    fn has_null(&self) -> bool {
+        self.0.iter().any(Option::is_none)
+    }
+}
 
 fn scalar_bits_eq(a: &ScalarValue, b: &ScalarValue) -> bool {
     match (a, b) {
@@ -541,6 +694,110 @@ mod tests {
         assert_eq!(batch.column(0).value(0), Some(ScalarValue::Int64(10000)));
         assert_eq!(batch.column(1).value(0), Some(ScalarValue::Int64(12000)));
         assert_eq!(batch.column(2).value(0), Some(ScalarValue::Float64(11166.666666666666)));
+    }
+
+    /// left: (key, l_val) — key 1 twice, key 2 once, one NULL key.
+    /// right: (key, r_val) — key 1 once, key 3 once, one NULL key.
+    fn join_sources() -> (Arc<dyn PhysicalPlan>, Arc<dyn PhysicalPlan>) {
+        let make = |names: [&str; 2], keys: Vec<Option<i64>>, vals: Vec<&str>| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(names[0], DataType::Int64, true),
+                Field::new(names[1], DataType::Utf8, false),
+            ]));
+            let batch: RecordBatch = ArrowRecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(StringArray::from(vals)),
+                ],
+            )
+            .unwrap()
+            .into();
+            let source = Arc::new(InMemoryDataSource::new(schema, vec![batch]));
+            Arc::new(ScanExec::new(source, vec![])) as Arc<dyn PhysicalPlan>
+        };
+        (
+            make(["k", "l"], vec![Some(1), Some(1), Some(2), None], vec!["a", "b", "c", "d"]),
+            make(["k2", "r"], vec![Some(1), Some(3), None], vec!["x", "y", "z"]),
+        )
+    }
+
+    fn join_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("l", DataType::Utf8, true),
+            Field::new("k2", DataType::Int64, true),
+            Field::new("r", DataType::Utf8, true),
+        ]))
+    }
+
+    fn rows_of(batch: &RecordBatch) -> Vec<Vec<Option<ScalarValue>>> {
+        let mut rows: Vec<Vec<_>> = (0..batch.row_count())
+            .map(|i| (0..batch.column_count()).map(|c| batch.column(c).value(i)).collect())
+            .collect();
+        rows.sort_by_key(|r| format!("{r:?}"));
+        rows
+    }
+
+    fn s(v: &str) -> Option<ScalarValue> {
+        Some(ScalarValue::Utf8(v.to_string()))
+    }
+
+    fn i(v: i64) -> Option<ScalarValue> {
+        Some(ScalarValue::Int64(v))
+    }
+
+    #[test]
+    fn inner_join_matches_and_ignores_null_keys() {
+        let (left, right) = join_sources();
+        let join = HashJoinExec::new(left, right, JoinType::Inner, vec![0], vec![0], join_schema());
+
+        let batch = join.execute().next().unwrap();
+        // key 1: two left rows × one right row = 2 output rows. NULL keys never match.
+        assert_eq!(
+            rows_of(&batch),
+            vec![
+                vec![i(1), s("a"), i(1), s("x")],
+                vec![i(1), s("b"), i(1), s("x")],
+            ]
+        );
+        assert_eq!(join.to_string(), "HashJoinExec: type=Inner, on=[#0 = #0]");
+    }
+
+    #[test]
+    fn left_join_pads_unmatched_build_rows() {
+        let (left, right) = join_sources();
+        let join = HashJoinExec::new(left, right, JoinType::Left, vec![0], vec![0], join_schema());
+
+        let batch = join.execute().next().unwrap();
+        // 2 matches + unmatched left rows: key 2, and the NULL-key row.
+        // (rows_of sorts by debug string, so None-leading rows come first)
+        assert_eq!(
+            rows_of(&batch),
+            vec![
+                vec![None, s("d"), None, None],
+                vec![i(1), s("a"), i(1), s("x")],
+                vec![i(1), s("b"), i(1), s("x")],
+                vec![i(2), s("c"), None, None],
+            ]
+        );
+    }
+
+    #[test]
+    fn right_join_pads_unmatched_probe_rows() {
+        let (left, right) = join_sources();
+        let join = HashJoinExec::new(left, right, JoinType::Right, vec![0], vec![0], join_schema());
+
+        let batch = join.execute().next().unwrap();
+        assert_eq!(
+            rows_of(&batch),
+            vec![
+                vec![None, None, None, s("z")],
+                vec![None, None, i(3), s("y")],
+                vec![i(1), s("a"), i(1), s("x")],
+                vec![i(1), s("b"), i(1), s("x")],
+            ]
+        );
     }
 
     #[test]
