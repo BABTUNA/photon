@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 
 use crate::logical_expr::{AggregateExpr, LogicalExpr};
-use crate::logical_plan::{Aggregate, LogicalPlan, Projection, Selection};
+use crate::logical_plan::{Aggregate, Join, JoinType, LogicalPlan, Projection, Selection};
 
 pub struct DataFrame {
     plan: Arc<dyn LogicalPlan>,
@@ -41,6 +41,21 @@ impl DataFrame {
             self.plan,
             group_exprs,
             aggregate_exprs,
+        )))
+    }
+
+    /// JOIN ... ON: combine with `right` on equi-join key pairs
+    /// (left name, right name).
+    pub fn join(self, right: &DataFrame, join_type: JoinType, on: Vec<(&str, &str)>) -> DataFrame {
+        let on = on
+            .into_iter()
+            .map(|(l, r)| (l.to_string(), r.to_string()))
+            .collect();
+        DataFrame::new(Arc::new(Join::new(
+            self.plan,
+            right.logical_plan(),
+            join_type,
+            on,
         )))
     }
 
