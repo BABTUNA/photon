@@ -7,7 +7,7 @@
 use engine::dataframe::DataFrame;
 use engine::datatypes::{RecordBatch, ScalarValue};
 use engine::execution::ExecutionContext;
-use engine::logical_expr::{col, lit};
+use engine::logical_expr::{avg, col, count, lit, max, sum};
 
 fn int(v: i64) -> Option<ScalarValue> {
     Some(ScalarValue::Int64(v))
@@ -73,4 +73,69 @@ fn filter_on_a_computed_predicate() {
     );
     // NULL passes through projection untouched.
     assert_eq!(column_values(&batches, 1), vec![text("CA"), text("CO"), None]);
+}
+
+/// Group output order is nondeterministic (hash map); find rows by key.
+fn row_by_key(batch: &RecordBatch, key: Option<ScalarValue>) -> Vec<Option<ScalarValue>> {
+    let row = (0..batch.row_count())
+        .find(|&i| batch.column(0).value(i) == key)
+        .unwrap_or_else(|| panic!("no group with key {key:?}"));
+    (0..batch.column_count())
+        .map(|c| batch.column(c).value(row))
+        .collect()
+}
+
+#[test]
+fn grouped_aggregate_end_to_end() {
+    let df = ExecutionContext::new()
+        .csv("testdata/employee.csv")
+        .aggregate(
+            vec![col("state")],
+            vec![max(col("salary")), count(col("id"))],
+        );
+
+    let batches = run(&df);
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.row_count(), 3); // CA, CO, and the NULL state
+
+    assert_eq!(
+        row_by_key(batch, text("CA")),
+        vec![text("CA"), int(12000), int(1)]
+    );
+    assert_eq!(
+        row_by_key(batch, text("CO")),
+        vec![text("CO"), int(11500), int(2)]
+    );
+    // SQL GROUP BY puts all NULL keys in ONE group.
+    assert_eq!(row_by_key(batch, None), vec![None, int(11800), int(1)]);
+}
+
+#[test]
+fn global_aggregate_without_group_by() {
+    let df = ExecutionContext::new().csv("testdata/employee.csv").aggregate(
+        vec![],
+        vec![sum(col("salary")), avg(col("salary")), count(col("state"))],
+    );
+
+    let batches = run(&df);
+    let batch = &batches[0];
+    assert_eq!(batch.row_count(), 1);
+    assert_eq!(batch.column(0).value(0), int(45300));
+    assert_eq!(batch.column(1).value(0), Some(ScalarValue::Float64(11325.0)));
+    // COUNT(state) skips the NULL: 3, not 4.
+    assert_eq!(batch.column(2).value(0), int(3));
+}
+
+#[test]
+fn filter_feeds_aggregate() {
+    // Only salaries >= 11000 reach the aggregate.
+    let df = ExecutionContext::new()
+        .csv("testdata/employee.csv")
+        .filter(col("salary").gt_eq(lit(11000i64)))
+        .aggregate(vec![], vec![count(col("id")), max(col("salary"))]);
+
+    let batch = &run(&df)[0];
+    assert_eq!(batch.column(0).value(0), int(3));
+    assert_eq!(batch.column(1).value(0), int(12000));
 }
